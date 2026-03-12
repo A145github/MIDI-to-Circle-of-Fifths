@@ -6,6 +6,7 @@ a simple open source program that visualizes MIDI input using Circle of Fifths i
 # Download and How to Run
 For now...
 <img width="1151" height="485" alt="Screenshot 2026-03-12 105919" src="https://github.com/user-attachments/assets/8ba4cf45-840f-429f-8a8b-2a8f3ee2b838" />
+
 Click the big green code thingy then "Download ZIP". Once downloaded, extract it then go in the main program and run ".exe" file in the folder somewhere to run.
 
 Project started for personal reasons because I think its cool to see MIDI this way, decided to upload it here because why not. 
