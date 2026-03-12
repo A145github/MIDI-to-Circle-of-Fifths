@@ -1,0 +1,576 @@
+import java.util.Collections;
+import javax.sound.midi.*;
+import java.util.Arrays;
+
+// MIDI dropdown state
+int    selectedDeviceIndex = -1;         // –1 == none chosen yet
+boolean midiDropdown       = false;
+long[] noteTimestamps = new long[12];
+int notetimeout = 5000;
+
+// dropdown layout
+float ddX = 20, ddY = 20, ddW = 240, ddH = 24;
+
+// Processing color is just an int under the hood
+color bgColor             = color(45);          // dark mode background
+color baseCircleColor     = color(120);         // the big outer ring
+color lineColor           = color(255);         // active-chord lines (RGB only)
+color nodeActiveColor     = color(100,180,255); // when a notes on
+color nodeInactiveColor   = color(70,70,70,255); // when its off (with alpha)
+color textOnColor         = color(200);         // note labels when active
+color textOffColor        = color(150);         // note labels when inactive
+color deviceSelectBg      = color(20);           // same as bg or whatever
+color devicePromptColor   = color(200, 200, 200); // Select MIDI input text
+color deviceListItemColor = color(255);          // each device line
+color ringColor = color(200);
+color weirdglow = color(0);
+color keybuffercolor = color(0);
+
+
+// circle sizing (tweak these two!)
+float radiusPct           = 0.4;  // radius of note‐points circle, as fraction of the smaller window side
+float baseCirclePct       = 0.8;  // diameter of outer ring, as fraction of the smaller window side
+
+// theme state
+boolean darkTheme = true;
+
+// per-pitch alpha (cosmetic fading, 0…255)
+float[] noteAlpha = new float[12];
+
+// new: per-pitch *core* state (snaps instantly, 0 or 255)
+float[] noteCoreAlpha = new float[12];
+
+// fade speed: fraction of delta toward target alpha per frame
+float fadeSpeed = 0.25;
+
+// — MIDI device selection state
+MidiDevice midiDevice;
+MidiInputReceiver midiReceiver;
+ArrayList<MidiDevice.Info> inputInfos;
+
+// — Active pitch-class flags (0=C,1=C#,2=D…11=B)
+int[] pcCounts = new int[12];
+boolean[] activePC = new boolean[12]; // still keep this for your visuals
+
+// — Circle of fifths ordering and mapping
+int[] circleOrder  = {0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5};
+int[] pcToPos      = new int[12];
+
+// — Screen coords for each of the 12 circle points
+float[] cx = new float[12], cy = new float[12];
+
+// — the computed radius (global so update function can set it)
+float radius;
+
+// — Note names for labels
+String[] noteNames = {
+  "C", "C#", "D", "D#", "E", "F",
+  "F#", "G", "G#", "A", "A#", "B"
+};
+
+// Key detector
+RingKeyDetector ringDetector;
+
+void setup() {
+  // Renderer
+  size(800, 800);
+  smooth(8); 
+  
+  surface.setResizable(true); // allow window resize
+  
+  // gui setup ms
+
+
+ 
+  textFont(createFont("Arial", 16));
+  textAlign(CENTER, CENTER);
+  ellipseMode(CENTER);
+
+  for (int i = 0; i < 12; i++) {
+    noteAlpha[i] = 0;
+  }
+
+  // build reverse lookup: pc -> circle index
+  for (int i = 0; i < 12; i++) {
+    pcToPos[circleOrder[i]] = i;
+  }
+
+  // enumerate all MIDI devices that can transmit (i.e. inputs)
+  inputInfos = new ArrayList<MidiDevice.Info>();
+  for (MidiDevice.Info info : MidiSystem.getMidiDeviceInfo()) {
+    try {
+      MidiDevice dev = MidiSystem.getMidiDevice(info);
+      // if it can send us data, it's an input
+      if (dev.getMaxTransmitters() != 0) {
+        inputInfos.add(info);
+      }
+    }
+    catch (MidiUnavailableException e) {
+      // skip unavailable ones
+    }
+  }
+
+  setDarkTheme();
+
+  // compute initial positions
+  updateCirclePositions();
+  
+  
+  
+  ringDetector = new RingKeyDetector(
+    7,               // always 7 tones in a major key
+    pcToPos,
+    circleOrder,
+    noteNames
+  );
+}
+
+void setDarkTheme() {
+  bgColor               = color(35);
+  baseCircleColor       = color(120);
+  lineColor             = color(255);
+  nodeActiveColor       = color(100, 200, 200);
+  nodeInactiveColor     = color(70, 70, 70, 255);
+  textOnColor           = color(200);
+  textOffColor          = color(150);
+  deviceSelectBg        = color(20);
+  devicePromptColor     = color(200, 200, 200);
+  deviceListItemColor   = color(255);
+  ringColor             = color(120);
+  weirdglow             = color(0);
+  keybuffercolor = color(80, 80, 0);
+}
+
+void setLightTheme() {
+  bgColor               = color(225);
+  baseCircleColor       = color(80);
+  lineColor             = color(0);
+  nodeActiveColor       = color(255, 80, 80);
+  nodeInactiveColor     = color(170, 170, 170, 255);
+  textOnColor           = color(0);
+  textOffColor          = color(80);
+  deviceSelectBg        = color(250);
+  devicePromptColor     = color(200);
+  deviceListItemColor   = color(0);
+  ringColor             = color(100);
+  weirdglow             = color(255);
+  keybuffercolor = color(160, 200, 130);
+}
+
+// Recompute radius & positions so the circle fits both axes.
+// Uses the smaller of width/height so the layout never clips.
+void updateCirclePositions() {
+  // radius uses the smaller window dimension so circle always fits
+  float minDim = min(width, height);
+  float padding = 40; // extra padding so labels don't touch the window edge
+  radius = (minDim * radiusPct) - padding;
+
+  // ensure radius positive
+  if (radius < 10) radius = 10;
+
+  for (int i = 0; i < 12; i++) {
+    float angle = TWO_PI/12 * i - PI/2; // start at top
+    cx[i] = width/2 + cos(angle) * radius;
+    cy[i] = height/2 + sin(angle) * radius;
+  }
+}
+
+
+void draw() { 
+  // Auto-clear stuck notes after 5 seconds
+  for (int i = 0; i < 12; i++) {
+    if (pcCounts[i] > 0 && millis() - noteTimestamps[i] > notetimeout) {
+      pcCounts[i] = 0;
+      activePC[i] = false;
+      noteAlpha[i] = 0;
+      noteCoreAlpha[i] = 0;
+      println("Auto-cleared stuck note: " + noteNames[i]);
+    }
+  }
+
+  background(bgColor);
+  ringDetector.drawRings(cx, cy, 30, color(keybuffercolor));  // e.g., yellow rings
+  
+  
+  // recompute positions each frame in case user resized
+  updateCirclePositions();
+  
+  // --- MIDI Dropdown ---
+  fill(deviceSelectBg);
+  noStroke();
+  rect(ddX, ddY, ddW, ddH);
+
+  // Selected or placeholder label
+  fill(textOffColor);
+  textAlign(LEFT, CENTER);
+  String label = selectedDeviceIndex < 0
+    ? "Select MIDI input…"
+    : inputInfos.get(selectedDeviceIndex).getName();
+  text(label, ddX + 8, ddY + ddH/2);
+
+  // Arrow indicator
+  textAlign(RIGHT, CENTER);
+  text(midiDropdown ? "▲" : "▼", ddX + ddW - 8, ddY + ddH/2);
+
+  // List items (only if open)
+  if (midiDropdown) {
+    for (int i = 0; i < inputInfos.size(); i++) {
+      float y = ddY + ddH * (i + 1);
+      fill(i == selectedDeviceIndex ? 100 : 50);
+      rect(ddX, y, ddW, ddH);
+      fill(devicePromptColor);
+      textAlign(LEFT, CENTER);
+      text(inputInfos.get(i).getName(), ddX + 8, y + ddH/2);
+    }
+  }
+
+  for (int pc = 0; pc < 12; pc++) {
+    // snap instantly for core state
+    noteCoreAlpha[pc] = activePC[pc] ? 255 : 0;
+  
+    // fade cosmetically for visuals
+    float target = activePC[pc] ? 255 : 0;
+    noteAlpha[pc] = lerp(noteAlpha[pc], target, fadeSpeed);
+  }
+
+  // draw base circle using the smaller dimension so it stays circular
+  float ringDiameter = min(width, height) * baseCirclePct;
+  stroke(ringColor);
+  noFill();
+  ellipse(width/2, height/2, ringDiameter, ringDiameter);
+
+  // build sorted circle indices of active PCs (snap instantly)
+  ArrayList<Integer> held = new ArrayList<>();
+  for (int pc = 0; pc < 12; pc++) {
+    if (noteCoreAlpha[pc] > 0) { // instant on/off
+      held.add(pcToPos[pc]);
+    }
+  }
+  
+  Collections.sort(held);
+  
+  strokeWeight(2);
+  if (held.size() > 1) {
+    for (int i = 0; i < held.size(); i++) {
+      int a = held.get(i), b = held.get((i+1)%held.size());
+      float alpha = (noteAlpha[circleOrder[a]] + noteAlpha[circleOrder[b]])/2;
+      stroke(
+        red(lineColor),
+        green(lineColor),
+        blue(lineColor),
+        alpha * 0.7
+      );
+      line(cx[a], cy[a], cx[b], cy[b]);
+    }
+  }
+  
+  fill(textOffColor);
+  textAlign(RIGHT, TOP);
+  text("Midi Timeout (ms): " + notetimeout, width - 20, 20);
+  text("[Press '+' or '-' to adjust]", width - 20, 40);
+  text("Press 'T' to change theme", width - 20, 80);
+  text("Press 'R' to reset MIDI", width - 20, 100);
+  
+  fill(textOffColor);
+  textAlign(LEFT, BOTTOM);
+  text("Made with <3, Ayi.", 20, height - 20);
+  
+  fill(textOffColor);
+  textAlign(RIGHT, BOTTOM);
+  text("v0.2", width - 20, height - 20);
+
+  // —— nodes & labels —— (same behavior as before)
+  textAlign(CENTER, CENTER);
+  noStroke();
+
+  for (int i = 0; i < 12; i++) {
+    int pc = circleOrder[i];
+
+    float t = constrain(noteAlpha[pc] / 255.0, 0, 1);
+    color nodeColor = lerpColor(nodeInactiveColor, nodeActiveColor, t);
+    fill(nodeColor);
+    ellipse(cx[i], cy[i], 30, 30);
+
+    color labelColor = lerpColor(textOffColor, textOnColor, t);
+    fill(labelColor);
+    
+    // vector from center to note
+    float angle = atan2(cy[i] - height/2, cx[i] - width/2);
+    
+    // text offset (radius from node center)
+    float labelDist = 40; 
+    float tx = cx[i] + cos(angle) * labelDist;
+    float ty = cy[i] + sin(angle) * labelDist;
+    
+    text(noteNames[pc], tx, ty);
+  }
+
+  // final draw pass (keeps previous visual behavior)
+  textAlign(CENTER, CENTER);
+  strokeWeight(0);
+  for (int i = 0; i < 12; i++) {
+    int pc = circleOrder[i];
+    float a  = noteAlpha[pc];
+
+    if (a > 1) 
+      fill(nodeActiveColor, a);
+    else 
+      fill(nodeInactiveColor);
+
+    ellipse(cx[i], cy[i], 30, 30);
+
+    if (a > 1) 
+      fill(textOnColor, a);
+    else 
+      fill(textOffColor);
+  }
+  
+  String keyName = ringDetector.detectKeyName();
+  if (keyName != null) {
+    fill(textOnColor);
+    textAlign(CENTER, CENTER);
+    text(keyName, width/2, 30);
+  }
+  
+}
+
+// capture key to select device
+void keyPressed() {
+    if (key == 't' || key == 'T') {
+    darkTheme = !darkTheme;
+    if (darkTheme) setDarkTheme();
+    else           setLightTheme();
+    println("Switched to " + (darkTheme ? "Dark" : "Light") + " theme");
+    return;
+  }
+
+  // MIDI reset
+  if (key == 'r' || key == 'R') {
+    resetMidiDevice();
+    println("MIDI reset triggered");
+    return;
+  }
+  if (key == 't' || key == 'T') {
+    darkTheme = !darkTheme;
+    if (darkTheme) setDarkTheme();
+    else           setLightTheme();
+    println("Switched to " + (darkTheme ? "Dark" : "Light") + " theme");
+    return;
+  }
+  
+  if (key == '+' || key == '=') {
+    notetimeout += 1000; // add 1s
+    println("Note timeout set to " + notetimeout + " ms");
+  }
+  
+  if (key == '-' || key == '_') {
+    notetimeout = max(1000, notetimeout - 1000); // min 1s
+    println("Note timeout set to " + notetimeout + " ms");
+  }
+}
+
+// custom MIDI Receiver to track note on/off
+class MidiInputReceiver implements Receiver {
+  public void send(MidiMessage msg, long timeStamp) {
+  if (msg instanceof ShortMessage) {
+    ShortMessage sm = (ShortMessage) msg;
+    int cmd  = sm.getCommand();
+    int note = sm.getData1();
+    int vel  = sm.getData2();
+    int pc   = note % 12;
+
+    if (cmd == ShortMessage.NOTE_ON && vel > 0) {
+      pcCounts[pc]++;                 // increment
+      ringDetector.addNote(pc);
+      noteTimestamps[pc] = millis();
+    } else if (cmd == ShortMessage.NOTE_OFF ||
+              (cmd == ShortMessage.NOTE_ON && vel == 0)) {
+      pcCounts[pc] = max(0, pcCounts[pc] - 1); // decrement, clamp at 0
+      noteTimestamps[pc] = millis();
+    }
+
+    // refresh activePC flags
+    for (int i = 0; i < 12; i++) {
+      activePC[i] = pcCounts[i] > 0;
+    }
+  }
+}
+  public void close() {}
+}
+
+void mousePressed() {
+  // Check if click is inside the main dropdown box
+  if (mouseX >= ddX && mouseX <= ddX + ddW &&
+      mouseY >= ddY && mouseY <= ddY + ddH) {
+    midiDropdown = !midiDropdown; // toggle open/close
+    return;
+  }
+
+  // If dropdown is open, check if clicked an item
+  if (midiDropdown) {
+    for (int i = 0; i < inputInfos.size(); i++) {
+      float y = ddY + ddH * (i + 1);
+      if (mouseX >= ddX && mouseX <= ddX + ddW &&
+          mouseY >= y && mouseY <= y + ddH) {
+        selectMidiDevice(i);
+        break;
+      }
+    }
+    midiDropdown = false; // close after selection
+  }
+}
+
+
+// reuse your existing device-open logic
+void selectMidiDevice(int idx) {
+  if (midiDevice != null && midiDevice.isOpen()) midiDevice.close();
+  selectedDeviceIndex = idx;
+
+  try {
+    MidiDevice.Info info = inputInfos.get(idx);
+    midiDevice = MidiSystem.getMidiDevice(info);
+    midiDevice.open();
+    Transmitter t = midiDevice.getTransmitter();
+    midiReceiver = new MidiInputReceiver();
+    t.setReceiver(midiReceiver);
+    println("Opened MIDI: " + info.getName());
+  } catch (Exception e) {
+    println("Error opening device " + idx + ": " + e);
+  }
+}
+
+void resetMidiDevice() {
+  if (selectedDeviceIndex >= 0) {
+    try {
+      if (midiDevice != null && midiDevice.isOpen()) {
+        midiDevice.close();
+      }
+      MidiDevice.Info info = inputInfos.get(selectedDeviceIndex);
+      midiDevice = MidiSystem.getMidiDevice(info);
+      midiDevice.open();
+      Transmitter t = midiDevice.getTransmitter();
+      midiReceiver = new MidiInputReceiver();
+      t.setReceiver(midiReceiver);
+
+      // Reset all note states
+      Arrays.fill(pcCounts, 0);
+      Arrays.fill(activePC, false);
+      Arrays.fill(noteAlpha, 0);
+      Arrays.fill(noteCoreAlpha, 0);
+
+      println("MIDI device reset: " + info.getName());
+    } catch (Exception e) {
+      println("Error resetting MIDI device: " + e);
+    }
+  }
+  
+  // Reset all note states
+  Arrays.fill(pcCounts, 0);
+  Arrays.fill(activePC, false);
+  Arrays.fill(noteAlpha, 0);
+  Arrays.fill(noteCoreAlpha, 0);
+
+  // Reset key detector buffer
+  if (ringDetector != null) {
+    ringDetector.reset();
+  }
+  
+}
+
+
+
+/**
+ * Tracks up to N distinct pitch‐classes (rings), in insertion order,
+ * and detects a major key when they form 7 consecutive positions
+ * around a circle of fifths.
+ */
+class RingKeyDetector {
+  final int maxRings;
+  final int[] pcToPos;       // maps PC (0–11) → circle index (0–11)
+  final int[] circleOrder;   // your existing circleOrder[]
+  final String[] noteNames;  // your noteNames[]
+
+  ArrayList<Integer> buffer; // stores PCs in insertion order
+
+  RingKeyDetector(int maxRings,
+                  int[] pcToPos,
+                  int[] circleOrder,
+                  String[] noteNames) {
+    this.maxRings     = maxRings;
+    this.pcToPos      = pcToPos;
+    this.circleOrder  = circleOrder;
+    this.noteNames    = noteNames;
+    this.buffer       = new ArrayList<Integer>();
+  }
+
+  /** Call this on each NOTE_ON where pcCounts[pc] just went from 0→1. */
+  void addNote(int pc) {
+    synchronized(buffer) {
+      if (buffer.contains(pc)) return;
+      if (buffer.size() >= maxRings) buffer.remove(0);
+      buffer.add(pc);
+      }
+    }
+
+
+  /**
+   * Returns the root PC of the detected major key, or –1 if no key found.
+   * A key is found when the 7 ringed PCs occupy 7 consecutive positions
+   * around the circle of fifths.
+   */
+  int detectKey() {
+    if (buffer.size() < maxRings) return -1;
+
+    // snapshot again
+    ArrayList<Integer> snapshot = new ArrayList<>(buffer);
+    boolean[] hasRing = new boolean[12];
+    for (int pc : snapshot) {
+      hasRing[ pcToPos[pc] ] = true;
+    }
+  
+
+    // look for 7 consecutive positions
+    for (int start = 0; start < 12; start++) {
+      boolean ok = true;
+      for (int offset = 0; offset < maxRings; offset++) {
+        if (!hasRing[(start + offset) % 12]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        // major key = note one step clockwise from the first ring
+        int keyCircleIndex = (start + 1) % 12;
+        return circleOrder[keyCircleIndex];
+      }
+    }
+    return -1;
+  }
+
+  /** Nicely formatted name (e.g., "C Major"), or null if none. */
+  String detectKeyName() {
+    int keyPc = detectKey();
+    return keyPc >= 0
+      ? "Key: " + noteNames[keyPc] + " Major"
+      : null;
+  }
+  
+  void drawRings(float[] cx, float[] cy, float nodeDiameter, color keybuffercolor) {
+  pushStyle();
+    stroke(keybuffercolor); 
+    strokeWeight(4);
+    noFill();
+  
+    // take a snapshot
+    ArrayList<Integer> snapshot = new ArrayList<>(buffer);
+    for (int pc : snapshot) {
+      int pos = pcToPos[pc];
+      ellipse(cx[pos], cy[pos], nodeDiameter + 12, nodeDiameter + 12);
+    }
+  popStyle();
+  }
+  
+  void reset() {
+    buffer.clear();
+  }
+}
